@@ -1,0 +1,60 @@
+[package]
+name = "indexray"
+version = "1.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/fjuhy/indexray"
+description = "Native Windows search for local documents and Outlook mail"
+autobins = false
+
+[[bin]]
+name = "IndexRay"
+path = "src/bin/indexray/main.rs"
+
+[[bin]]
+name = "indexray-cli"
+path = "src/bin/cli/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.6.1", features = ["derive"] }
+ctrlc = "3.5.2"
+directories = "6"
+rmcp = { version = "3.0.1", features = ["server", "macros", "transport-io", "schemars"] }
+schemars = "1.2.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std"] }
+
+[dependencies.dowse]
+git = "https://github.com/fjuhy/dowse.git"
+rev = "f1a36710d2a5880cf283daffc648f301964717de"
+default-features = false
+
+[dev-dependencies]
+lindera = { version = "6.2.0", default-features = false, features = ["mmap", "embed-ko-dic"] }
+rmcp = { version = "3.0.1", features = ["client", "transport-child-process"] }
+
+[build-dependencies]
+embed-resource = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi",
+    "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com",
+    "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_LibraryLoader",
+    "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Registry",
+    "Win32_System_Threading", "Win32_UI_Accessibility", "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs", "Win32_UI_Controls_RichEdit", "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

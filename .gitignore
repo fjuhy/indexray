@@ -1,0 +1,24 @@
+/target
+/release/
+/testdata
+
+# 打包/构建过程遗留的临时产物，别提交进仓库
+/build_*.log
+/build_pid.txt
+/release_staging/
+/release_notes.txt
+/dowse-cli-windows-x64.zip
+/.omc/
+
+# MCPB 打包产物：exe 由构建复制进来，bundle 是打包输出，都不进仓库
+/mcpb/server/
+*.mcpb
+
+# Tauri sidecar 产物：构建时从 target/release 复制进来，不进仓库
+/crates/dowse-app/src-tauri/binaries/
+# 설치 파일용 한국어 사전: scripts/prepare-ko-dic.mjs가 빌드 때 준비한다
+/crates/dowse-app/src-tauri/ko-dic/
+
+# Playwright MCP 调试产物
+/.playwright-mcp/
+/dowse-site-full.png

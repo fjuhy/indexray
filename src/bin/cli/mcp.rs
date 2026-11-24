@@ -1,0 +1,1027 @@
+//! `dowse mcp`：stdio 传输的只读 MCP server，把本地索引暴露给 AI agent。
+//!
+//! 安全边界（见 docs/DESIGN-M5-MCP.md 第二、三节）：
+//! - 这个进程绝不碰 IndexWriter，没有任何会修改索引的工具；
+//! - 每次工具调用前都对 reader 做一次 reload，读到浮窗侧最新提交的段；
+//! - 索引不存在/损坏时返回结构化的工具级错误（`isError: true` + 建库指引），不 panic。
+
+use std::ops::Range;
+use std::path::PathBuf;
+
+use dowse::{
+    IndexStatus, PreviewHit, SearchHit, Searcher, SortMode, index_status as core_index_status,
+};
+use rmcp::handler::server::tool::{IntoCallToolResult, schema_for_output};
+use rmcp::handler::server::wrapper::{Json, Parameters};
+use rmcp::model::{
+    CallToolResponse, CallToolResult, Implementation, InitializeResult, ServerCapabilities,
+};
+use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+/// 命中片段里高亮命中词的前后缀标记（不透出字节区间，agent 直接可读）。
+const HL_OPEN: &str = "«";
+const HL_CLOSE: &str = "»";
+
+/// search 工具的默认返回条数。
+const DEFAULT_SEARCH_LIMIT: usize = 10;
+
+/// 避免失控的 agent 一次把整个索引搬进上下文。
+const MAX_SEARCH_LIMIT: usize = 100;
+const MAX_SEARCH_OFFSET: usize = 10_000;
+
+const DEFAULT_READ_CHARS: usize = 4_000;
+const MAX_READ_CHARS: usize = 8_000;
+
+// ---------- 工具参数 ----------
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchParams {
+    /// 검색식. `name:` 파일명, `body:` 본문, `ext:pdf,docx` 확장자, `path:` 경로,
+    /// `title:` 제목, `author:` 작성자, `mtime:>=2026-01` 수정일과 `size:<10mb` 크기를 지원합니다.
+    /// 공백은 AND로 처리합니다. 큰따옴표로 구문을 지정하고 괄호와 대문자 AND / OR / NOT으로 조건을 조합합니다.
+    pub query: String,
+    /// 最多返回几条，默认 10；和 offset 搭配翻页
+    #[schemars(range(min = 1, max = MAX_SEARCH_LIMIT))]
+    pub limit: Option<usize>,
+    /// 跳过前多少条命中再取，默认 0；和 limit 搭配翻页（取第 2 页就传 offset=limit）。
+    /// 返回里的 total_hits 是匹配总数，offset + 本页条数 < total_hits 就说明后面还有
+    #[schemars(range(max = MAX_SEARCH_OFFSET))]
+    pub offset: Option<usize>,
+    /// 只保留这些扩展名的结果（不含点）。逗号分隔可给多个，如 "md" 或 "md,pdf,txt"；
+    /// 不需要按扩展名过滤就整个字段别传（传空串或纯逗号会报参数错误）
+    pub ext: Option<String>,
+    /// 排序方式：relevance（默认，按相关度）/ mtime（按修改时间，新的在前）/
+    /// size（按体积，大的在前）。非 relevance 排序下 BM25 分数没有意义，结果里
+    /// 不返回 score 字段。传其它值会报参数错误
+    pub sort: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PreviewParams {
+    /// 目标文件的完整路径，取自 search 结果里的 path 字段
+    pub path: String,
+    /// 定位高亮用的查询词，通常和 search 时用的一致
+    pub query: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadFileChunkParams {
+    /// 目标文件的完整路径，必须来自 search 结果
+    pub path: String,
+    /// 从第几个 Unicode 字符开始，默认 0
+    pub offset_chars: Option<usize>,
+    /// 本次最多返回多少个 Unicode 字符，默认 4000，上限 8000
+    #[schemars(range(min = 1, max = MAX_READ_CHARS))]
+    pub max_chars: Option<usize>,
+}
+
+// ---------- 工具返回 ----------
+
+// Deserialize 只给测试用（CallToolResult::into_typed 反序列化 structured_content
+// 回一个具体类型来断言），运行时只往外序列化，不会反过来解。
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SearchHitOut {
+    /// 命中文件的完整路径，可直接喂给文件读取/资源管理器工具
+    pub path: String,
+    /// BM25 相关度分数：只有 sort=relevance（默认）时才有意义并返回；按 mtime/size
+    /// 排序时分数固定为 0、没有意义，这个字段整个省略（不是返回 0）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+    /// 命中上下文片段，命中词用 «» 包起来
+    pub snippet: String,
+    /// 文件扩展名（不含点，小写），无扩展名是空串
+    pub kind: String,
+    /// 文档属性里的作者（Office docProps/core.xml 的 creator 或 PDF Info 的 Author）；
+    /// 没有时省略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// 文档属性里的标题（不是文件名）；没有时省略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// 文档属性里的创建时间，Unix 毫秒时间戳（UTC）；与文件系统 mtime 无关，没有时省略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_created_unix_ms: Option<i64>,
+    /// 文档属性里的修改时间，Unix 毫秒时间戳（UTC）；与文件系统 mtime 无关，没有时省略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_modified_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SearchOutput {
+    pub hits: Vec<SearchHitOut>,
+    /// 满足本次查询的命中总数（不受 limit/offset 截断）。配合 offset 判断要不要翻
+    /// 下一页：offset + hits.len() < total_hits 就说明后面还有
+    pub total_hits: usize,
+    /// 索引里的文档总数（不是本次命中数），给 agent 判断索引规模用
+    pub total_docs: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct PreviewOutput {
+    /// 命中上下文片段（约 1500 字），命中词用 «» 包起来
+    pub snippet: String,
+    /// 原文件体积（字节）
+    pub size: u64,
+    /// 原文件 mtime，Unix 毫秒时间戳
+    pub mtime_unix_ms: i64,
+    /// 文件扩展名（不含点，小写），无扩展名是空串
+    pub kind: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ReadFileChunkOutput {
+    /// 本页已索引正文；来自索引快照，不会重新读取原文件
+    pub content: String,
+    /// 本页从全文第几个 Unicode 字符开始
+    pub offset_chars: usize,
+    /// 本页实际返回的 Unicode 字符数
+    pub returned_chars: usize,
+    /// 下一页起点；为 null 时表示已读完
+    pub next_offset_chars: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct IndexStatusOutput {
+    /// 索引里的文档总数
+    pub num_docs: u64,
+    /// 已注册的索引根目录
+    pub roots: Vec<String>,
+    /// 索引落盘体积（字节）
+    pub disk_size_bytes: u64,
+    /// 最近一次更新时间，Unix 毫秒时间戳；索引目录异常读不到文件 mtime 时是 null
+    pub last_updated_unix_ms: Option<i64>,
+    /// 当前生效的索引规则：哪些目录被排除、额外当文本索引的扩展名、单文件体积上限。
+    /// 让 agent 明白"为什么某些文件搜不到"（可能被排除或超体积上限挡在索引外）
+    pub rules: IndexRulesOut,
+    /// 색인을 만들 때 한국어 형태소 사전(ko-dic)을 썼는지; 기록 이전 색인이면 생략
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub korean_morphology_indexed: Option<bool>,
+    /// 지금 ko-dic을 쓸 수 있는지
+    #[serde(default)]
+    pub korean_morphology_available: bool,
+    /// 색인 시점과 지금의 사전 유무가 달라 재색인이 권장될 때의 안내문; 문제 없으면 생략
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reindex_hint: Option<String>,
+    /// 다시 색인하는 게 좋은 근(폴더) 목록; 없으면 생략
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reindex_roots: Vec<String>,
+}
+
+/// 索引规则的对外投影，对应核心库的 `IndexRules`。只读透出给 agent 看，
+/// 让"某些文件因规则没进索引"这类现象有据可查。
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct IndexRulesOut {
+    /// 索引时排除的目录名列表（这些目录整棵子树都不收录）
+    pub exclude_dirs: Vec<String>,
+    /// 在内置文本类型之外、额外当作文本索引的扩展名（不含点）
+    pub extra_text_exts: Vec<String>,
+    /// 单文件体积上限（MB），超过的文件不进索引
+    pub max_file_mb: u64,
+}
+
+/// 把命中区间标成 «...»，供 agent 直接阅读。区间切片逻辑跟终端染色共用
+/// `crate::wrap_highlight_ranges`，只是包裹标记不同。
+fn mark_highlights(fragment: &str, ranges: &[Range<usize>]) -> String {
+    crate::wrap_highlight_ranges(fragment, ranges, HL_OPEN, HL_CLOSE)
+}
+
+/// 把一条命中转成对外结构。`include_score` 只在相关性排序下为真——按 mtime/size
+/// 排序时 BM25 分数固定为 0、没有意义，此时把 score 整个省掉（跟 CLI 隐藏分数一致），
+/// 而不是回一个会误导 agent 的 0。
+fn to_search_hit_out(hit: SearchHit, include_score: bool) -> SearchHitOut {
+    SearchHitOut {
+        path: hit.path,
+        score: include_score.then_some(hit.score),
+        snippet: mark_highlights(&hit.snippet, &hit.highlighted),
+        kind: hit.ext,
+        author: hit.author,
+        title: hit.title,
+        doc_created_unix_ms: hit.doc_created,
+        doc_modified_unix_ms: hit.doc_modified,
+    }
+}
+
+/// 把 MCP 的 sort 参数映射到核心库的 [`SortMode`]。
+///
+/// 对外只暴露 relevance/mtime/size 三档（比核心库的 mtime_desc/mtime_asc/size_desc
+/// 精简）：mtime 取"新的在前"（MtimeDesc）、size 取"大的在前"（SizeDesc），是搜索
+/// 场景下最符合直觉的方向。未知值直接报参数错误——不像核心库 `SortMode::parse`
+/// 那样静默回退到相关性排序，好让 agent 立刻知道值不对，而不是拿到一份"其实没按
+/// 它要求排"的结果。
+fn parse_sort(raw: Option<&str>) -> Result<SortMode, McpError> {
+    match raw {
+        None | Some("relevance") => Ok(SortMode::Relevance),
+        Some("mtime") => Ok(SortMode::MtimeDesc),
+        Some("size") => Ok(SortMode::SizeDesc),
+        Some(other) => Err(McpError::invalid_params(
+            format!("未知的 sort 值 \"{other}\"，只支持 relevance / mtime / size"),
+            None,
+        )),
+    }
+}
+
+fn to_preview_output(hit: PreviewHit) -> PreviewOutput {
+    PreviewOutput {
+        snippet: mark_highlights(&hit.snippet, &hit.highlighted),
+        size: hit.size,
+        mtime_unix_ms: hit.mtime,
+        kind: hit.ext,
+    }
+}
+
+fn to_index_status_output(status: IndexStatus) -> IndexStatusOutput {
+    let last_updated_unix_ms = status.last_updated.and_then(|t| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_millis() as i64)
+    });
+    let reindex_hint = status.korean_dictionary_mismatch().then(|| {
+        "색인을 만들 때와 지금의 한국어 사전(ko-dic) 사용 여부가 다릅니다. 한글 검색을 정확하게 하려면 reindex_roots의 폴더를 다시 색인하세요(`indexray-cli add <폴더>`는 등록된 폴더만 다시 색인하고 다른 폴더는 그대로 둠)."
+            .to_string()
+    });
+    let reindex_roots = status
+        .korean_reindex_roots
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    IndexStatusOutput {
+        num_docs: status.num_docs,
+        korean_morphology_indexed: status.korean_morphology_indexed,
+        korean_morphology_available: status.korean_morphology_available,
+        reindex_hint,
+        reindex_roots,
+        roots: status
+            .roots
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect(),
+        disk_size_bytes: status.disk_size_bytes,
+        last_updated_unix_ms,
+        rules: IndexRulesOut {
+            exclude_dirs: status.rules.exclude_dirs,
+            extra_text_exts: status.rules.extra_text_exts,
+            max_file_mb: status.rules.max_file_mb,
+        },
+    }
+}
+
+/// 索引打不开（不存在/损坏/schema 版本不对）时统一的工具级错误：
+/// 一句人话 + 一句建库指引。
+///
+/// 特意用 `CallToolResult::structured_error`（工具级错误，`isError: true`）
+/// 而不是 `Err(McpError)`（协议级错误）：请求本身没问题，是索引状态的问题，
+/// 协议级错误在很多 MCP 客户端里会被不透明地渲染成"internal error"，agent
+/// 看不到具体文案；工具级错误的 content/structured_content 才是 agent 真正
+/// 能读到、能据此决定"提示用户先建库"的地方。见 docs/DESIGN-M5-MCP.md 第五节。
+fn index_unavailable_result(err: &anyhow::Error) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "error": "index_unavailable",
+        "message": format!("索引不可用：{err}"),
+        "hint": "先用 `indexray-cli index <目录>` 建一次索引",
+    }))
+}
+
+/// 打开 searcher 并 reload 到最新提交的段。读取类工具的公共开场：
+/// 每次请求都重新打开+reload，不缓存 Searcher 实例——浮窗侧随时可能提交新的段，
+/// 常驻一个 Searcher 会读到过期数据（见 docs/DESIGN-M5-MCP.md 第二节的并发约束）。
+///
+/// 返回 `Err(CallToolResult)` 而不是 `Err(McpError)`：索引不可用是工具级错误，
+/// 调用方直接 `return Ok(e)` 短路成功分支即可，
+/// 见上面 index_unavailable_result 的说明。
+fn open_and_reload(index_dir: &std::path::Path) -> Result<Searcher, CallToolResult> {
+    let searcher = Searcher::open(index_dir).map_err(|e| index_unavailable_result(&e))?;
+    searcher
+        .reload()
+        .map_err(|e| index_unavailable_result(&e))?;
+    Ok(searcher)
+}
+
+/// rmcp 3 为 MRTR 引入了 `CallToolResponse`，`Json<T>` 的转换结果也因此
+/// 从 `CallToolResult` 变成了 `CallToolResponse`。这里的工具都是同步完成的
+/// 只读工具，因此只接受 `Complete` 分支，并保持工具路由的返回类型为
+/// `CallToolResult`。
+fn json_tool_result<T>(value: T) -> Result<CallToolResult, McpError>
+where
+    T: Serialize + JsonSchema + 'static,
+{
+    match Json(value).into_call_tool_result()? {
+        CallToolResponse::Complete(result) => Ok(result),
+        _ => Err(McpError::internal_error(
+            "JSON 工具结果不应产生 MRTR 中间响应",
+            None,
+        )),
+    }
+}
+
+#[derive(Clone)]
+pub struct DowseMcpServer {
+    index_dir: PathBuf,
+}
+
+#[tool_router]
+impl DowseMcpServer {
+    pub fn new(index_dir: PathBuf) -> Self {
+        Self { index_dir }
+    }
+
+    #[tool(
+        description = "로컬 색인을 검색합니다. 검색식에서 name:, body:, ext:, path:, title:, author:, mtime:, size: 조건을 대문자 AND / OR / NOT 또는 괄호로 조합할 수 있습니다. 기본 정렬은 관련도순입니다. sort로 정렬을 바꾸고 limit과 offset으로 결과를 나눠 읽습니다. total_hits는 전체 결과 수입니다. 더 긴 본문은 preview로 읽습니다.",
+        output_schema = schema_for_output::<SearchOutput>(),
+        annotations(title = "全文搜索", read_only_hint = true)
+    )]
+    async fn search(
+        &self,
+        Parameters(SearchParams {
+            query,
+            limit,
+            offset,
+            ext,
+            sort,
+        }): Parameters<SearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if query.trim().is_empty() {
+            return Err(McpError::invalid_params("query 不能为空", None));
+        }
+        let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+        if !(1..=MAX_SEARCH_LIMIT).contains(&limit) {
+            return Err(McpError::invalid_params(
+                format!("limit 必须在 1..={MAX_SEARCH_LIMIT} 之间"),
+                None,
+            ));
+        }
+        let offset = offset.unwrap_or(0);
+        if offset > MAX_SEARCH_OFFSET {
+            return Err(McpError::invalid_params(
+                format!("offset 不能大于 {MAX_SEARCH_OFFSET}"),
+                None,
+            ));
+        }
+        let sort_mode = parse_sort(sort.as_deref())?;
+
+        // ext 是单个逗号分隔字符串（"md" 或 "md,pdf"），按逗号拆开后走和 CLI 同一套
+        // 清洗规则（crate::clean_ext_tokens 剔空串 + trim + 小写归一）。传了 ext 却拆
+        // 不出任何有效扩展名（""、","、",," 之类）算参数错误：调用方想过滤却没给值，
+        // 别静默放宽成"不过滤"。
+        let ext_tokens: Vec<String> = match &ext {
+            Some(raw) => {
+                let tokens = crate::clean_ext_tokens(raw.split(','));
+                if tokens.is_empty() {
+                    return Err(McpError::invalid_params(
+                        "ext 传了就至少要有一个有效扩展名（逗号分隔，如 \"md,pdf\"），不需要过滤就整个字段别传",
+                        None,
+                    ));
+                }
+                tokens
+            }
+            None => Vec::new(),
+        };
+        let ext_refs: Vec<&str> = ext_tokens.iter().map(String::as_str).collect();
+        let ext_group = (!ext_refs.is_empty()).then_some(ext_refs.as_slice());
+
+        let searcher = match open_and_reload(&self.index_dir) {
+            Ok(s) => s,
+            Err(tool_error) => return Ok(tool_error),
+        };
+        let page = searcher
+            .search_paged(&query, limit, offset, ext_group, sort_mode)
+            .map_err(|e| McpError::invalid_params(format!("查询语法有问题：{e}"), None))?;
+
+        // 只有相关性排序下 BM25 分数才有意义；mtime/size 排序时不带 score。
+        let include_score = sort_mode == SortMode::Relevance;
+        json_tool_result(SearchOutput {
+            hits: page
+                .hits
+                .into_iter()
+                .map(|hit| to_search_hit_out(hit, include_score))
+                .collect(),
+            total_hits: page.total,
+            total_docs: searcher.num_docs(),
+        })
+    }
+
+    #[tool(
+        description = "取某个文件在索引里命中查询词的完整上下文（约 1500 字，比 search 返回的摘要长得多），附带文件大小/修改时间/类型。path 用 search 结果里的 path 字段。",
+        output_schema = schema_for_output::<PreviewOutput>(),
+        annotations(title = "文件预览", read_only_hint = true)
+    )]
+    async fn preview(
+        &self,
+        Parameters(PreviewParams { path, query }): Parameters<PreviewParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if path.trim().is_empty() {
+            return Err(McpError::invalid_params("path 不能为空", None));
+        }
+        if query.trim().is_empty() {
+            return Err(McpError::invalid_params("query 不能为空", None));
+        }
+
+        let searcher = match open_and_reload(&self.index_dir) {
+            Ok(s) => s,
+            Err(tool_error) => return Ok(tool_error),
+        };
+        let hit = searcher
+            .preview(&path, &query)
+            .map_err(|e| McpError::invalid_params(format!("查询语法有问题：{e}"), None))?;
+
+        match hit {
+            Some(hit) => json_tool_result(to_preview_output(hit)),
+            // 路径本身没问题（不是参数错误），是索引里当下就是找不到这篇——
+            // 文件可能已被删除、或改名后索引还没重新收录。跟"索引不可用"一样，
+            // 是运行时状态问题，agent 应该看得到，所以也是工具级错误。
+            None => Ok(CallToolResult::structured_error(json!({
+                "error": "path_not_found",
+                "message": format!("索引里找不到这个路径：{path}"),
+                "hint": "文件可能已被删除、改名，或改动后索引还没重新收录；可以先用 search 重新定位",
+            }))),
+        }
+    }
+
+    #[tool(
+        description = "按 Unicode 字符分页读取某个文件的已索引正文。path 必须取自 search 结果；内容来自只读索引快照，不会直接读取任意磁盘路径。默认从 offset_chars=0 开始返回最多 4000 字，单次上限 8000；若 next_offset_chars 非空，用它继续读取下一页。",
+        output_schema = schema_for_output::<ReadFileChunkOutput>(),
+        annotations(title = "分块读取已索引正文", read_only_hint = true)
+    )]
+    async fn read_file_chunk(
+        &self,
+        Parameters(ReadFileChunkParams {
+            path,
+            offset_chars,
+            max_chars,
+        }): Parameters<ReadFileChunkParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if path.trim().is_empty() {
+            return Err(McpError::invalid_params("path 不能为空", None));
+        }
+        let max_chars = max_chars.unwrap_or(DEFAULT_READ_CHARS);
+        if !(1..=MAX_READ_CHARS).contains(&max_chars) {
+            return Err(McpError::invalid_params(
+                format!("max_chars 必须在 1..={MAX_READ_CHARS} 之间"),
+                None,
+            ));
+        }
+
+        let searcher = match open_and_reload(&self.index_dir) {
+            Ok(s) => s,
+            Err(tool_error) => return Ok(tool_error),
+        };
+        match searcher
+            .read_indexed_content_chunk(&path, offset_chars.unwrap_or(0), max_chars)
+            .map_err(|e| McpError::internal_error(format!("读取索引正文失败：{e}"), None))?
+        {
+            Some(chunk) => json_tool_result(ReadFileChunkOutput {
+                content: chunk.content,
+                offset_chars: chunk.offset_chars,
+                returned_chars: chunk.returned_chars,
+                next_offset_chars: chunk.next_offset_chars,
+            }),
+            None => Ok(CallToolResult::structured_error(json!({
+                "error": "path_not_found",
+                "message": format!("索引里找不到这个路径：{path}"),
+                "hint": "文件可能已被删除、改名，或改动后索引还没重新收录；可以先用 search 重新定位",
+            }))),
+        }
+    }
+
+    #[tool(
+        description = "查看本地索引的概况：文档总数、已注册的索引根目录、索引落盘体积、最近一次更新时间，以及当前生效的索引规则（排除目录/追加文本扩展名/单文件体积上限）。不需要参数。",
+        output_schema = schema_for_output::<IndexStatusOutput>(),
+        annotations(title = "索引状态", read_only_hint = true)
+    )]
+    async fn index_status(&self) -> Result<CallToolResult, McpError> {
+        match core_index_status(&self.index_dir) {
+            Ok(status) => json_tool_result(to_index_status_output(status)),
+            Err(e) => Ok(index_unavailable_result(&e)),
+        }
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for DowseMcpServer {
+    fn get_info(&self) -> InitializeResult {
+        InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(
+                Implementation::new("indexray-cli", "1.1.0")
+                    .with_title("IndexRay")
+                    .with_description("IndexRay 로컬 문서 검색"),
+            )
+            .with_instructions(
+                "IndexRay 是本地全文搜索索引的只读接口。先用 search 定位文件；用 preview 查看命中附近上下文，\
+                 需要更多正文时按 next_offset_chars 分页调用 read_file_chunk；也可以先用 index_status 检查索引范围与更新时间。\
+                 read_file_chunk 只返回已经入索引的内容，不直接读取任意路径。这里没有修改文件或索引的工具——\
+                 建立/重建索引由用户在 IndexRay 或 `indexray-cli index` CLI 中触发。",
+            )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mark_highlights_wraps_ranges_with_marks() {
+        // 特意只标一个区间：clippy 的 single_range_in_vec_init 是给 vec![a..b] 这种
+        // "大概率想要 0..b 里每个数"的误用场景提的，这里就是想要单个 Range，不是误用。
+        #[allow(clippy::single_range_in_vec_init)]
+        let ranges = [0..5];
+        let out = mark_highlights("hello world", &ranges);
+        assert_eq!(out, "«hello» world");
+    }
+
+    #[test]
+    fn mark_highlights_multiple_ranges() {
+        let out = mark_highlights("限流中间件的实现", &[0..6, 12..15]);
+        assert_eq!(out, "«限流»中间«件»的实现");
+    }
+
+    #[test]
+    fn mark_highlights_no_ranges_returns_original() {
+        let out = mark_highlights("nothing highlighted", &[]);
+        assert_eq!(out, "nothing highlighted");
+    }
+
+    #[tokio::test]
+    async fn search_rejects_empty_query() {
+        let server = DowseMcpServer::new(PathBuf::from("does-not-matter"));
+        let err = server
+            .search(Parameters(SearchParams {
+                query: "   ".to_owned(),
+                limit: None,
+                offset: None,
+                ext: None,
+                sort: None,
+            }))
+            .await
+            .expect_err("空查询词应该报参数错误");
+        assert!(err.message.contains("query"));
+    }
+
+    #[tokio::test]
+    async fn search_rejects_unsafe_pagination() {
+        let server = DowseMcpServer::new(PathBuf::from("does-not-matter"));
+        let err = server
+            .search(Parameters(SearchParams {
+                query: "笔记".to_owned(),
+                limit: Some(0),
+                offset: None,
+                ext: None,
+                sort: None,
+            }))
+            .await
+            .expect_err("limit=0 应该报参数错误");
+        assert!(err.message.contains("limit"));
+
+        let err = server
+            .search(Parameters(SearchParams {
+                query: "笔记".to_owned(),
+                limit: Some(MAX_SEARCH_LIMIT + 1),
+                offset: None,
+                ext: None,
+                sort: None,
+            }))
+            .await
+            .expect_err("过大的 limit 应该报参数错误");
+        assert!(err.message.contains(&MAX_SEARCH_LIMIT.to_string()));
+
+        let err = server
+            .search(Parameters(SearchParams {
+                query: "笔记".to_owned(),
+                limit: None,
+                offset: Some(MAX_SEARCH_OFFSET + 1),
+                ext: None,
+                sort: None,
+            }))
+            .await
+            .expect_err("过大的 offset 应该报参数错误");
+        assert!(err.message.contains(&MAX_SEARCH_OFFSET.to_string()));
+    }
+
+    #[tokio::test]
+    async fn search_rejects_empty_ext_string() {
+        let server = DowseMcpServer::new(PathBuf::from("does-not-matter"));
+        let err = server
+            .search(Parameters(SearchParams {
+                query: "笔记".to_owned(),
+                limit: None,
+                offset: None,
+                ext: Some(String::new()),
+                sort: None,
+            }))
+            .await
+            .expect_err("空字符串的 ext 应该报参数错误");
+        assert!(err.message.contains("ext"));
+    }
+
+    #[tokio::test]
+    async fn search_on_missing_index_returns_tool_level_error_with_build_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_index = tmp.path().join("no-such-index");
+        let server = DowseMcpServer::new(missing_index);
+
+        // 索引不存在是工具级错误（Ok(CallToolResult{is_error: true, ..})），
+        // 不是协议级 Err——这样 agent 才能读到具体错误文案，见 index_unavailable_result 的说明。
+        let result = server
+            .search(Parameters(SearchParams {
+                query: "笔记".to_owned(),
+                limit: None,
+                offset: None,
+                ext: None,
+                sort: None,
+            }))
+            .await
+            .expect("索引不存在不应该让 tools/call 本身失败，而是回一个 isError:true 的结果");
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("应该带结构化错误内容");
+        let message = structured["message"].as_str().unwrap_or_default();
+        let hint = structured["hint"].as_str().unwrap_or_default();
+        assert!(
+            hint.contains("indexray-cli index"),
+            "hint 字段应带建库指引: {structured:#?}"
+        );
+        assert!(!message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn preview_rejects_empty_path() {
+        let server = DowseMcpServer::new(PathBuf::from("does-not-matter"));
+        let err = server
+            .preview(Parameters(PreviewParams {
+                path: "".to_owned(),
+                query: "笔记".to_owned(),
+            }))
+            .await
+            .expect_err("空 path 应该报参数错误");
+        assert!(err.message.contains("path"));
+    }
+
+    #[tokio::test]
+    async fn preview_on_missing_index_returns_tool_level_error_with_build_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_index = tmp.path().join("no-such-index");
+        let server = DowseMcpServer::new(missing_index);
+
+        let result = server
+            .preview(Parameters(PreviewParams {
+                path: "C:\\somewhere\\note.md".to_owned(),
+                query: "笔记".to_owned(),
+            }))
+            .await
+            .expect("索引不存在不应该让 tools/call 本身失败，而是回一个 isError:true 的结果");
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("应该带结构化错误内容");
+        let hint = structured["hint"].as_str().unwrap_or_default();
+        assert!(
+            hint.contains("indexray-cli index"),
+            "hint 字段应带建库指引: {structured:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_status_on_missing_index_returns_tool_level_error_with_build_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_index = tmp.path().join("no-such-index");
+        let server = DowseMcpServer::new(missing_index);
+
+        let result = server
+            .index_status()
+            .await
+            .expect("索引不存在不应该让 tools/call 本身失败，而是回一个 isError:true 的结果");
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("应该带结构化错误内容");
+        let hint = structured["hint"].as_str().unwrap_or_default();
+        assert!(
+            hint.contains("indexray-cli index"),
+            "hint 字段应带建库指引: {structured:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_and_preview_round_trip_on_real_index() {
+        let index_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::Builder::new()
+            .prefix("dowse-mcp-test-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(
+            target_dir.path().join("note.md"),
+            "系统采用分布式限流器保护后端服务。",
+        )
+        .unwrap();
+        dowse::rebuild_index(index_dir.path(), target_dir.path()).unwrap();
+
+        let server = DowseMcpServer::new(index_dir.path().to_path_buf());
+
+        let search_result = server
+            .search(Parameters(SearchParams {
+                query: "限流器".to_owned(),
+                limit: None,
+                offset: None,
+                ext: None,
+                sort: None,
+            }))
+            .await
+            .expect("索引存在，search 不应该报错");
+        assert_ne!(search_result.is_error, Some(true));
+        let search_out: SearchOutput = search_result
+            .into_typed()
+            .expect("search 的 structured_content 应该能解回 SearchOutput");
+        assert_eq!(search_out.hits.len(), 1);
+        assert!(search_out.hits[0].snippet.contains(HL_OPEN));
+        assert_eq!(search_out.hits[0].kind, "md");
+        // 默认按相关度排序，score 应当带出来。
+        assert!(search_out.hits[0].score.is_some());
+        assert_eq!(search_out.total_hits, 1);
+        assert_eq!(search_out.total_docs, 1);
+
+        let path = search_out.hits[0].path.clone();
+        let preview_result = server
+            .preview(Parameters(PreviewParams {
+                path: path.clone(),
+                query: "限流器".to_owned(),
+            }))
+            .await
+            .expect("文件存在，preview 不应该报错");
+        assert_ne!(preview_result.is_error, Some(true));
+        let preview_out: PreviewOutput = preview_result
+            .into_typed()
+            .expect("preview 的 structured_content 应该能解回 PreviewOutput");
+        assert!(preview_out.snippet.contains(HL_OPEN));
+        assert_eq!(preview_out.kind, "md");
+        assert!(preview_out.size > 0);
+
+        let first_chunk: ReadFileChunkOutput = server
+            .read_file_chunk(Parameters(ReadFileChunkParams {
+                path: path.clone(),
+                offset_chars: None,
+                max_chars: Some(5),
+            }))
+            .await
+            .expect("已索引文件应该能分块读取")
+            .into_typed()
+            .expect("read_file_chunk 应返回结构化内容");
+        assert_eq!(first_chunk.content, "系统采用分");
+        assert_eq!(first_chunk.returned_chars, 5);
+        assert!(first_chunk.next_offset_chars.is_some());
+
+        let tail: ReadFileChunkOutput = server
+            .read_file_chunk(Parameters(ReadFileChunkParams {
+                path,
+                offset_chars: first_chunk.next_offset_chars,
+                max_chars: Some(MAX_READ_CHARS),
+            }))
+            .await
+            .expect("下一页应该能继续读取")
+            .into_typed()
+            .expect("下一页应返回结构化内容");
+        assert!(tail.content.contains("限流器"));
+        assert_eq!(tail.next_offset_chars, None);
+
+        let status_result = server
+            .index_status()
+            .await
+            .expect("索引存在，index_status 不应该报错");
+        assert_ne!(status_result.is_error, Some(true));
+        let status_out: IndexStatusOutput = status_result
+            .into_typed()
+            .expect("index_status 的 structured_content 应该能解回 IndexStatusOutput");
+        assert_eq!(status_out.num_docs, 1);
+        assert_eq!(status_out.roots.len(), 1);
+        assert!(status_out.disk_size_bytes > 0);
+        assert!(status_out.last_updated_unix_ms.is_some());
+        // 没建 rules.json 时应回落到默认规则：单文件上限 20MB、排除列表非空。
+        assert_eq!(status_out.rules.max_file_mb, 20);
+        assert!(!status_out.rules.exclude_dirs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_file_chunk_rejects_oversized_page() {
+        let server = DowseMcpServer::new(PathBuf::from("does-not-matter"));
+        let err = server
+            .read_file_chunk(Parameters(ReadFileChunkParams {
+                path: "C:\\somewhere\\note.md".to_owned(),
+                offset_chars: None,
+                max_chars: Some(MAX_READ_CHARS + 1),
+            }))
+            .await
+            .expect_err("超过单页上限应该报参数错误");
+        assert!(err.message.contains(&MAX_READ_CHARS.to_string()));
+    }
+
+    #[test]
+    fn parse_sort_maps_known_values_and_rejects_unknown() {
+        // 三个对外档位映射到核心库的 SortMode；None/relevance 都是相关性排序。
+        assert_eq!(parse_sort(None).unwrap(), SortMode::Relevance);
+        assert_eq!(parse_sort(Some("relevance")).unwrap(), SortMode::Relevance);
+        assert_eq!(parse_sort(Some("mtime")).unwrap(), SortMode::MtimeDesc);
+        assert_eq!(parse_sort(Some("size")).unwrap(), SortMode::SizeDesc);
+        // 未知值报参数错误，不静默回退（跟 CLI/核心库的静默回退刻意不同）。
+        assert!(parse_sort(Some("bogus")).is_err());
+        assert!(parse_sort(Some("mtime_desc")).is_err());
+    }
+
+    #[test]
+    fn clean_ext_tokens_drops_empty_segments() {
+        // 逗号分隔多个扩展名；`md,,txt` 拆出的空串被剔除。
+        assert_eq!(
+            crate::clean_ext_tokens("md,,txt".split(',')),
+            vec!["md", "txt"]
+        );
+        // 单个扩展名仍然可用（向后兼容）。
+        assert_eq!(crate::clean_ext_tokens("md".split(',')), vec!["md"]);
+        // 空串 / 纯逗号拆完为空，代表"没给有效扩展名"。
+        assert!(crate::clean_ext_tokens("".split(',')).is_empty());
+        assert!(crate::clean_ext_tokens(",,".split(',')).is_empty());
+        // 带空格 / 大写归一到索引里的小写无空格形态；纯空白段视同空串剔除。
+        assert_eq!(
+            crate::clean_ext_tokens("md, PDF".split(',')),
+            vec!["md", "pdf"]
+        );
+        assert!(crate::clean_ext_tokens(" , ".split(',')).is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_rejects_unknown_sort() {
+        let server = DowseMcpServer::new(PathBuf::from("does-not-matter"));
+        let err = server
+            .search(Parameters(SearchParams {
+                query: "笔记".to_owned(),
+                limit: None,
+                offset: None,
+                ext: None,
+                sort: Some("bogus".to_owned()),
+            }))
+            .await
+            .expect_err("未知 sort 应该报参数错误");
+        assert!(err.message.contains("sort"));
+    }
+
+    #[tokio::test]
+    async fn search_supports_sort_multi_ext_and_offset() {
+        let index_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::Builder::new()
+            .prefix("dowse-mcp-adv-")
+            .tempdir()
+            .unwrap();
+        // 三篇都含"限流"，两种扩展名、体积不同，方便验证多扩展名过滤、按 size 排序、翻页。
+        std::fs::write(target_dir.path().join("a.md"), "限流 限流 限流 aaaaaaaaaa").unwrap();
+        std::fs::write(target_dir.path().join("b.md"), "限流 bb").unwrap();
+        std::fs::write(target_dir.path().join("c.txt"), "限流 ccccc").unwrap();
+        dowse::rebuild_index(index_dir.path(), target_dir.path()).unwrap();
+        let server = DowseMcpServer::new(index_dir.path().to_path_buf());
+
+        // 多扩展名：md,txt 三篇全中，total_hits=3，相关性排序下每条都带 score。
+        let all: SearchOutput = server
+            .search(Parameters(SearchParams {
+                query: "限流".to_owned(),
+                limit: None,
+                offset: None,
+                ext: Some("md,txt".to_owned()),
+                sort: None,
+            }))
+            .await
+            .unwrap()
+            .into_typed()
+            .unwrap();
+        assert_eq!(all.total_hits, 3);
+        assert_eq!(all.hits.len(), 3);
+        assert!(all.hits.iter().all(|h| h.score.is_some()));
+
+        // 单扩展名仍然可用（向后兼容）：只 md 两篇。
+        let md: SearchOutput = server
+            .search(Parameters(SearchParams {
+                query: "限流".to_owned(),
+                limit: None,
+                offset: None,
+                ext: Some("md".to_owned()),
+                sort: None,
+            }))
+            .await
+            .unwrap()
+            .into_typed()
+            .unwrap();
+        assert_eq!(md.total_hits, 2);
+        assert!(md.hits.iter().all(|h| h.kind == "md"));
+
+        // 按 size 排序：不返回 score（跟 CLI 隐藏无意义分数一致）。
+        let by_size: SearchOutput = server
+            .search(Parameters(SearchParams {
+                query: "限流".to_owned(),
+                limit: None,
+                offset: None,
+                ext: None,
+                sort: Some("size".to_owned()),
+            }))
+            .await
+            .unwrap()
+            .into_typed()
+            .unwrap();
+        assert!(
+            by_size.hits.iter().all(|h| h.score.is_none()),
+            "size 排序不应带 score"
+        );
+
+        // 翻页：limit=1 分两次取，total_hits 恒为 3，两页拿到不同文档。
+        let page1: SearchOutput = server
+            .search(Parameters(SearchParams {
+                query: "限流".to_owned(),
+                limit: Some(1),
+                offset: Some(0),
+                ext: None,
+                sort: Some("size".to_owned()),
+            }))
+            .await
+            .unwrap()
+            .into_typed()
+            .unwrap();
+        assert_eq!(page1.total_hits, 3);
+        assert_eq!(page1.hits.len(), 1);
+        let page2: SearchOutput = server
+            .search(Parameters(SearchParams {
+                query: "限流".to_owned(),
+                limit: Some(1),
+                offset: Some(1),
+                ext: None,
+                sort: Some("size".to_owned()),
+            }))
+            .await
+            .unwrap()
+            .into_typed()
+            .unwrap();
+        assert_eq!(page2.hits.len(), 1);
+        assert_ne!(page1.hits[0].path, page2.hits[0].path, "翻页应拿到不同文档");
+    }
+
+    /// 文档属性（schema v8）要原样透出到 search 结果里；没有属性的文件四个字段整个省略。
+    #[tokio::test]
+    async fn search_hits_carry_document_properties() {
+        use std::io::Write;
+
+        let index_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::Builder::new()
+            .prefix("dowse-mcp-props-")
+            .tempdir()
+            .unwrap();
+        let core = r#"<?xml version="1.0" encoding="UTF-8"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+  xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/">
+  <dc:title>계통한계가격 분석</dc:title>
+  <dc:creator>홍길동</dc:creator>
+  <dcterms:created>2024-03-05T01:02:03Z</dcterms:created>
+  <dcterms:modified>2024-03-06T10:00:00+09:00</dcterms:modified>
+</cp:coreProperties>"#;
+        let body = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>propsmarker body</w:t></w:r></w:p></w:body></w:document>"#;
+        {
+            let file = std::fs::File::create(target_dir.path().join("report.docx")).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            for (name, content) in [("word/document.xml", body), ("docProps/core.xml", core)] {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(content.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        std::fs::write(target_dir.path().join("plain.md"), "propsmarker plain").unwrap();
+        dowse::rebuild_index(index_dir.path(), target_dir.path()).unwrap();
+
+        let server = DowseMcpServer::new(index_dir.path().to_path_buf());
+        let result = server
+            .search(Parameters(SearchParams {
+                query: "propsmarker".to_owned(),
+                limit: None,
+                offset: None,
+                ext: None,
+                sort: None,
+            }))
+            .await
+            .unwrap();
+        let raw = result.structured_content.clone().unwrap();
+        let out: SearchOutput = result.into_typed().unwrap();
+        assert_eq!(out.total_hits, 2);
+
+        let docx = out.hits.iter().find(|h| h.kind == "docx").unwrap();
+        assert_eq!(docx.author.as_deref(), Some("홍길동"));
+        assert_eq!(docx.title.as_deref(), Some("계통한계가격 분석"));
+        assert_eq!(docx.doc_created_unix_ms, Some(1_709_600_523_000));
+        assert_eq!(docx.doc_modified_unix_ms, Some(1_709_686_800_000));
+
+        let md = out.hits.iter().find(|h| h.kind == "md").unwrap();
+        assert_eq!(md.author, None);
+        // 没有属性时字段整个省略，而不是 null。
+        let md_raw = raw["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["kind"] == "md")
+            .unwrap();
+        for key in [
+            "author",
+            "title",
+            "doc_created_unix_ms",
+            "doc_modified_unix_ms",
+        ] {
+            assert!(md_raw.get(key).is_none(), "{key} 应被省略: {md_raw}");
+        }
+    }
+}
